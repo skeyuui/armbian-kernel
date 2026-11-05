@@ -1,0 +1,124 @@
+# Build Armbian "current" kernel for Orange Pi Zero 3 with what Redroid needs:
+# binder + binderfs built in (no host devices), PSI, 32-bit compat.
+#
+# Run it from the Actions tab ("Run workflow"). Result: a GitHub release with
+# Armbian-style .deb packages (linux-image, linux-dtb, linux-headers), plus a
+# fixed-name bundle that is always reachable at
+#   https://github.com/<you>/<repo>/releases/latest/download/kernel-debs.tar
+# Installing them on the Pi is a separate, supervised step.
+
+name: build-kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Armbian kernel branch"
+        default: "current"
+  # Uncomment for an automatic weekly build (Mondays 06:17 UTC):
+  # schedule:
+  #   - cron: "17 6 * * 1"
+
+permissions:
+  contents: write   # needed to create releases
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 340
+    env:
+      BOARD: orangepizero3
+      BRANCH: ${{ inputs.branch || 'current' }}
+      FAMILY: sunxi64
+    steps:
+      - name: Free disk space (runner has ~14GB free by default)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: false   # Armbian uses Docker
+          swap-storage: true
+
+      - name: Get Armbian build framework
+        run: git clone --depth=1 https://github.com/armbian/build armbian
+
+      - name: Kernel config = Armbian's own + Redroid additions
+        working-directory: armbian
+        run: |
+          base="config/kernel/linux-${FAMILY}-${BRANCH}.config"
+          test -f "$base" || { echo "No $base in Armbian build repo"; ls config/kernel | grep "$FAMILY"; exit 1; }
+          mkdir -p userpatches
+          cp "$base" "userpatches/linux-${FAMILY}-${BRANCH}.config"
+          # later lines override earlier ones when the kernel reads the config
+          cat >> "userpatches/linux-${FAMILY}-${BRANCH}.config" <<'EOF'
+          CONFIG_ANDROID_BINDER_IPC=y
+          CONFIG_ANDROID_BINDERFS=y
+          CONFIG_ANDROID_BINDER_DEVICES=""
+          CONFIG_PSI=y
+          # CONFIG_PSI_DEFAULT_DISABLED is not set
+          CONFIG_COMPAT=y
+          EOF
+          sed -i 's/^[[:space:]]*//' "userpatches/linux-${FAMILY}-${BRANCH}.config"
+          tail -n 8 "userpatches/linux-${FAMILY}-${BRANCH}.config"
+
+      - name: Build kernel packages
+        working-directory: armbian
+        run: |
+          ./compile.sh kernel \
+            BOARD="$BOARD" BRANCH="$BRANCH" \
+            KERNEL_CONFIGURE=no \
+            SHARE_LOG=no
+
+      - name: Verify the built kernel really has the options
+        working-directory: armbian
+        run: |
+          set -e
+          ls -la output/debs/
+          img=$(ls output/debs/linux-image-*.deb | head -1)
+          mkdir -p /tmp/k && dpkg-deb -x "$img" /tmp/k
+          cfg=$(ls /tmp/k/boot/config-* | head -1)
+          echo "Checking $cfg"
+          fail=0
+          for opt in ANDROID_BINDER_IPC ANDROID_BINDERFS PSI COMPAT; do
+            if grep -q "^CONFIG_${opt}=y" "$cfg"; then echo "OK      CONFIG_${opt}=y"
+            else echo "MISSING CONFIG_${opt}"; fail=1; fi
+          done
+          grep -E "^CONFIG_ANDROID_BINDER_DEVICES|^# CONFIG_PSI_DEFAULT_DISABLED|^CONFIG_PSI_DEFAULT_DISABLED" "$cfg" || true
+          [ "$fail" = 0 ] || exit 1
+          kver=$(basename "$cfg" | sed 's/^config-//')
+          echo "KVER=$kver" >> "$GITHUB_ENV"
+
+      - name: Bundle for the Pi (fixed name + checksums)
+        working-directory: armbian/output/debs
+        run: |
+          # only what the Pi installs: kernel image, device trees, headers
+          ls linux-image-*.deb linux-dtb-*.deb > /tmp/bundle.list      # required
+          ls linux-headers-*.deb >> /tmp/bundle.list 2>/dev/null || echo "no headers package (ok)"
+          tar -cf /tmp/kernel-debs.tar -T /tmp/bundle.list
+          cp $(cat /tmp/bundle.list) /tmp/
+          cd /tmp && sha256sum kernel-debs.tar $(cat /tmp/bundle.list) > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: kernel-${{ env.KVER }}-r${{ github.run_number }}
+          name: Kernel ${{ env.KVER }} (build ${{ github.run_number }})
+          make_latest: true
+          body: |
+            Armbian ${{ env.BRANCH }} kernel for Orange Pi Zero 3 with binder + binderfs, PSI and 32-bit compat (for Redroid).
+            On the Pi: download `kernel-debs.tar` from the latest release, check `SHA256SUMS`, then `dpkg -i`.
+          files: |
+            /tmp/kernel-debs.tar
+            /tmp/SHA256SUMS
+            /tmp/linux-*.deb
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-debs
+          path: armbian/output/debs/*.deb
+          retention-days: 30
